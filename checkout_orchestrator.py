@@ -1,6 +1,7 @@
 import os
 import hmac
 import hashlib
+import requests
 import json
 from typing import List, Dict, Any, Optional
 
@@ -75,6 +76,11 @@ class CommerceCheckoutOrchestrator:
 
         # 5. Build payment gateway payload configurations
         gateway_payload = {}
+        checkout_url = None
+        
+        # Check for Stripe API Key to perform real HTTP requests
+        stripe_api_key = os.environ.get("STRIPE_API_KEY")
+        
         if gateway.lower() == "stripe":
             gateway_payload = {
                 "payment_method_types": ["card"],
@@ -89,19 +95,27 @@ class CommerceCheckoutOrchestrator:
                     } for item in cart_items
                 ],
                 "mode": "payment",
-                "shipping_options": [
-                    {
-                        "shipping_rate_data": {
-                            "type": "fixed_amount",
-                            "fixed_amount": {"amount": int(shipping_cost * 100), "currency": "usd"},
-                            "display_name": "Standard Delivery"
-                        }
-                    }
-                ]
+                "success_url": "https://genpark.ai/checkout/success",
+                "cancel_url": "https://genpark.ai/checkout/cancel"
             }
-            if discount_amount > 0:
-                # Mock voucher application for Stripe Session creation API
-                gateway_payload["discounts"] = [{"coupon": "SAVE20_COUPON"}]
+            
+            # If Stripe API Key is provided, create a real Checkout Session
+            if stripe_api_key and stripe_api_key != "mock":
+                try:
+                    resp = requests.post(
+                        "https://api.stripe.com/v1/checkout/sessions",
+                        data=self._serialize_stripe_data(gateway_payload),
+                        auth=(stripe_api_key, ""),
+                        timeout=15
+                    )
+                    resp.raise_for_status()
+                    session_data = resp.json()
+                    checkout_url = session_data.get("url")
+                except Exception as e:
+                    raise CheckoutOrchestrationError(f"Stripe Session creation failed: {e}")
+            else:
+                checkout_url = "https://checkout.stripe.com/c/pay/mock_session_url"
+                
         else:
             # PayPal payload
             gateway_payload = {
@@ -119,6 +133,7 @@ class CommerceCheckoutOrchestrator:
                     }
                 ]
             }
+            checkout_url = "https://www.paypal.com/checkoutnow?token=mock_token"
 
         # 6. Generate cryptographic signature of checkout state to prevent client-side tampering
         serialized_state = json.dumps({
@@ -135,5 +150,23 @@ class CommerceCheckoutOrchestrator:
         return {
             "pricing_summary": pricing_summary,
             "gateway_payload": gateway_payload,
+            "checkout_url": checkout_url,
             "signature_hash": signature
         }
+
+    def _serialize_stripe_data(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Serializes complex payloads into Stripe URL-encoded format.
+        """
+        flat = {}
+        flat["success_url"] = payload["success_url"]
+        flat["cancel_url"] = payload["cancel_url"]
+        flat["mode"] = payload["mode"]
+        for idx, pm in enumerate(payload["payment_method_types"]):
+            flat[f"payment_method_types[{idx}]"] = pm
+        for idx, item in enumerate(payload["line_items"]):
+            flat[f"line_items[{idx}][price_data][currency]"] = item["price_data"]["currency"]
+            flat[f"line_items[{idx}][price_data][product_data][name]"] = item["price_data"]["product_data"]["name"]
+            flat[f"line_items[{idx}][price_data][unit_amount]"] = item["price_data"]["unit_amount"]
+            flat[f"line_items[{idx}][quantity]"] = item["quantity"]
+        return flat
